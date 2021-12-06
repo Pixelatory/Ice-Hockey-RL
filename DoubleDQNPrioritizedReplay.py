@@ -1,54 +1,15 @@
-import random
-import time
-from collections import deque, namedtuple
 import gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch as T
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-from random import sample, randint
-import heapq
-from ale_py import ALEInterface, SDL_SUPPORT
+from util import plot_learning_curve, Experience
+from PrioritizedMemory import PrioritizedMemory
 
-
-# This code is from https://www.youtube.com/watch?v=Yz1iEEF4MWc
-from notmyDDQNandPER.prioritized_memory import Memory
-
-
-def plot_learning_curve(x, scores, epsilons, filename):
-    fig = plt.figure()
-    ax = fig.add_subplot(111, label="1")
-    ax2 = fig.add_subplot(111, label="2", frame_on=False)
-
-    ax.plot(x, epsilons, color="C0")
-    ax.set_xlabel("Training Steps", color="C0")
-    ax.set_ylabel("Epsilon", color="C0")
-    ax.tick_params(axis='x', colors="C0")
-    ax.tick_params(axis='y', colors="C0")
-
-    N = len(scores)
-    running_avg = np.empty(N)
-    for t in range(N):
-        running_avg[t] = np.mean(scores[max(0, t - 100):(t + 1)])
-
-    ax2.scatter(x, running_avg, color="C1")
-    ax2.axes.get_xaxis().set_visible(False)
-    ax2.yaxis.tick_right()
-    ax2.set_ylabel('Score', color="C1")
-    ax2.yaxis.set_label_position('right')
-    ax2.tick_params(axis='y', color="C1")
-
-    plt.savefig(filename)
-
-Experience = namedtuple('Experience',
-                        field_names=['state', 'action',
-                                     'reward', 'done', 'new_state'])
-
-class DQN(nn.Module):
+class DDQN(nn.Module):
     def __init__(self, lr, n_actions, input_dims):
-        super(DQN, self).__init__()
+        super(DDQN, self).__init__()
 
         self.model = nn.Sequential(
             nn.Linear(input_dims, 128),
@@ -76,12 +37,12 @@ class Agent:
         self.eps_min = eps_min
         self.eps_iter = eps_iter
         self.action_space = [i for i in range(self.n_actions)]
-        self.experiences = Memory(experience_size)
+        self.experiences = PrioritizedMemory(experience_size)
 
         self.device = 'cuda' if T.cuda.is_available() else 'cpu'
         print(self.device)
-        self.Q = DQN(self.lr, self.n_actions, self.input_dims).to(self.device)
-        self.targetQ = DQN(self.lr, self.n_actions, self.input_dims).to(self.device)
+        self.Q = DDQN(self.lr, self.n_actions, self.input_dims).to(self.device)
+        self.targetQ = DDQN(self.lr, self.n_actions, self.input_dims).to(self.device)
         self.targetQ.load_state_dict(self.Q.state_dict())
         self.targetQ.eval()
 
@@ -108,7 +69,7 @@ class Agent:
         batch = Experience(*zip(*batch[0]))
 
         states = T.tensor(batch.state, dtype=T.float).to(self.device)
-        actions = T.tensor(batch.action, dtype=T.int64).to(self.device)
+        actions = T.tensor(batch.action, dtype=T.int).to(self.device)
         rewards = T.tensor(batch.reward, dtype=T.float).to(self.device)
         states_ = T.tensor(batch.new_state, dtype=T.float).to(self.device)
         dones = T.tensor(batch.done, dtype=T.int).to(self.device)
@@ -118,8 +79,10 @@ class Agent:
         target_Q_actions = T.argmax(online_Q, dim=1)
         target_Q = self.targetQ.forward(states_).gather(1, target_Q_actions.unsqueeze(1))
         target_Q = target_Q.squeeze(1)
+        # Notice: dones are the int of done
         target_Q = rewards.squeeze(1) + (self.gamma * target_Q * dones)
 
+        # Update the td-error in experiences
         for i in range(len(_batch[0])):
             self.experiences.update(_batch[1][i], T.abs(curr_Q[i] - target_Q[i]).item())
 
@@ -128,6 +91,7 @@ class Agent:
         loss.backward()
         self.Q.optimizer.step()
 
+        # Reset the target network weights to online network
         if self.learnCounter % targetSetIter:
             self.targetQ.load_state_dict(self.Q.state_dict())
             self.targetQ.eval()
@@ -159,7 +123,6 @@ if __name__ == '__main__':
     print("LEARNING RATE:", learning_rate)
     print("INPUT_DIM:", env.observation_space.shape[0])
     print("OUTPUT_DIM:", env.action_space.n)
-    print("This one has does NOT have updated layers another 128 neuron hidden layer and 10M frames")
 
     # Used for outputting data.
     scores = []
@@ -191,6 +154,7 @@ if __name__ == '__main__':
 
             # [reward] for rewards.squeeze(1) in agent.learn()
             # not done for calculating target Q value in agent.learn()
+            # Add to experiences but have to calculate td-error
             old_val = agent.Q.forward(T.tensor(obs, dtype=T.float, device=agent.device))[action].item()
             target_val = reward + (not done) * T.max(agent.targetQ.forward(T.tensor(obs_, dtype=T.float, device=agent.device)))
             agent.experiences.add(T.max(abs(old_val - target_val)).item(), Experience(obs, action, [reward], not done, obs_))
